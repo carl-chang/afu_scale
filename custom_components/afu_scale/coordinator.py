@@ -44,12 +44,19 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def parse_packet(data: bytes):
-    """解析 0xAC 体重报文，返回 (weight_kg, is_stable, impedance) 或 None。
+    """解析 0xAC 体重报文，返回 (weight_kg, is_stable, impedance, battery, charging) 或 None。
+
+      逆向自官方 App（com.afu.afudevicemanager / aijk_hardware_sdk）：
+      原始 20 字节报文 = IC V27 分帧（[18] 报文类型、[19] 校验和），实测示例：
+        ac 29 80 68 f4 56 02 00 05 40 00 64 00 00 00 00 00 29 d5 1b
       [0]  0xAC 魔数
-      [3]  体重高位 (-0x68 偏移)
+      [1]  device_type
+      [3]  体重高位 (-0x68 偏移，0x68 为状态位)
       [4:6] 体重中低位
-      [6]  0x02 表示数值锁定稳定
+      [6]  0x02 表示测量/锁定稳定（IC 协议中即 mode 字节）
+      [7]  mode==1 时的电量字节（bit7=充电中，低 7 位=电量%）
       [8:10] 阻抗 (Big Endian)
+      [11] mode==2 时的电量字节（4 字节 support_funs 之后，bit7=充电中，低 7 位=电量%）
     """
     if len(data) < 10 or data[0] != PACKET_MAGIC:
         return None
@@ -62,7 +69,18 @@ def parse_packet(data: bytes):
     # 过滤无效读数：体重<=0（称重结束）或阻抗过低（人已离开）
     if weight_kg <= 0.0 or impedance < 500.0:
         return None
-    return weight_kg, is_stable, impedance
+    battery = None
+    charging = False
+    # 电量位置取决于 mode 字节：1 在 data[7]，2 在 data[11]
+    idx = 11 if data[6] == 0x02 else 7
+    if len(data) > idx:
+        raw = data[idx] & 0xFF
+        level = raw & 0x7F
+        # 0x7F/0xFF 为"未知/无电量数据"，超过 100 的取值同样无效
+        if 0 < level <= 100:
+            battery = level
+            charging = bool(raw & 0x80)
+    return weight_kg, is_stable, impedance, battery, charging
 
 
 class AfuScaleCoordinator:
@@ -87,6 +105,8 @@ class AfuScaleCoordinator:
         self._last_data_at: float = 0.0
         self._idle_handle: asyncio.TimerHandle | None = None
         self.measuring_entity = None
+        self.charging_entity = None
+        self.raw_data_entity = None
 
     def _set_measuring(self, value: bool) -> None:
         if self.measuring == value:
@@ -94,6 +114,10 @@ class AfuScaleCoordinator:
         self.measuring = value
         if self.measuring_entity is not None:
             self.measuring_entity.async_update_state(value)
+
+    def _set_charging(self, value: bool) -> None:
+        if self.charging_entity is not None:
+            self.charging_entity.async_update_state(value)
 
     @callback
     def register_entity(self, key: str, entity: AfuSensor) -> None:
@@ -177,13 +201,15 @@ class AfuScaleCoordinator:
 
     def _on_notify(self, _characteristic, data: bytes) -> None:
         """bleak 通知回调（在事件循环中调用）。"""
+        if self.raw_data_entity is not None:
+            self.raw_data_entity.async_update_state(data.hex(" "))
         parsed = parse_packet(bytes(data))
         if parsed is None:
             return
-        weight_kg, is_stable, impedance = parsed
+        weight_kg, is_stable, impedance, battery, charging = parsed
         _LOGGER.debug(
-            "AFU Scale: %.2fkg stable=%s impedance=%.0fΩ",
-            weight_kg, is_stable, impedance,
+            "AFU Scale: %.2fkg stable=%s impedance=%.0fΩ battery=%s",
+            weight_kg, is_stable, impedance, battery,
         )
         self._set_measuring(True)
         self._last_data_at = time.monotonic()
@@ -194,6 +220,9 @@ class AfuScaleCoordinator:
         values["weight"] = weight_kg
         values["stable"] = 1.0 if is_stable else 0.0
         values["impedance"] = impedance
+        if battery is not None:
+            values["battery"] = battery
+            self._set_charging(charging)
         values["timestamp"] = dt_util.utcnow()
         for key, entity in self.entities.items():
             if key in values:
