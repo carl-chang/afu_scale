@@ -108,6 +108,130 @@ card_mod:
     {% endif %}
 ```
 
+## 完整前端配置代码
+```yaml
+cards:
+  - type: custom:mushroom-title-card
+    title: AFU 体脂秤
+    subtitle: AFU-WL-TZ-A1 · 沃莱科技
+    icon: mdi:scale-bathroom
+    icon_color: blue
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-chips-card
+        chips:
+          - type: entity
+            entity: binary_sensor.afu_ti_zhi_cheng_ce_liang_zhong
+            name: 测量中
+            icon: mdi:scale-bathroom
+            icon_color: blue
+            state_color: true
+          - type: entity
+            entity: sensor.afu_ti_zhi_cheng_zui_jin_ce_liang_shi_jian
+            name: 最近测量
+            icon: mdi:clock-outline
+  - type: grid
+    columns: 1
+    square: false
+    cards:
+      - type: sensor
+        entity: sensor.afu_ti_zhi_cheng_ti_zhong
+        name: 体重
+        unit_of_measurement: kg
+        icon: mdi:weight-kilogram
+        card_mod:
+          style: >
+            ha-card {
+              border-radius: 20px;
+              background: linear-gradient(135deg, #2a5298, #1e3c72);
+              color: white;
+              transition: border 0.3s ease, box-shadow 0.3s ease;
+            }
+
+            .name { font-size: 15px; color: rgba(255,255,255,.8); }
+
+            .state { font-size: 44px; font-weight: 700; color: #fff; }
+
+            .unit { font-size: 18px; color: rgba(255,255,255,.75); }
+
+            {% if is_state('binary_sensor.afu_ti_zhi_cheng_ce_liang_zhong','on')
+            %}
+
+            @keyframes afu-glow {
+              0%   { box-shadow: 0 0 0 0 rgba(255,140,0,.7); border-color: rgba(255,160,0,.9); }
+              70%  { box-shadow: 0 0 0 20px rgba(255,140,0,0); border-color: rgba(255,160,0,.9); }
+              100% { box-shadow: 0 0 0 0 rgba(255,140,0,0); border-color: rgba(255,160,0,.9); }
+            }
+
+            ha-card {
+              border: 2px solid rgba(255,160,0,.9);
+              background: linear-gradient(135deg, #ff7a00, #cc5200);
+              animation: afu-glow 1.2s ease-out infinite;
+            }
+
+            {% endif %}
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+      - type: custom:mushroom-template-card
+        primary: "{{ states('sensor.afu_ti_zhi_cheng_bmi') | float | round(2) }}"
+        secondary: BMI
+        icon: mdi:human-male-height
+        icon_color: blue
+      - type: custom:mushroom-template-card
+        primary: "{{ states('sensor.afu_ti_zhi_cheng_ti_zhi_lu') | float | round(2) }} %"
+        secondary: 体脂率
+        icon: mdi:percent
+        icon_color: red
+      - type: custom:mushroom-template-card
+        primary: >-
+          {{ states('sensor.afu_ti_zhi_cheng_shui_fen_lu') | float | round(2) }}
+          %
+        secondary: 水分率
+        icon: mdi:water-percent
+        icon_color: cyan
+      - type: custom:mushroom-template-card
+        primary: >-
+          {{ states('sensor.afu_ti_zhi_cheng_ji_rou_liang') | float | round(2)
+          }} kg
+        secondary: 肌肉量
+        icon: mdi:arm-flex-outline
+        icon_color: green
+      - type: custom:mushroom-template-card
+        primary: >-
+          {{ states('sensor.afu_ti_zhi_cheng_dan_bai_zhi_lu') | float | round(2)
+          }} %
+        secondary: 蛋白质率
+        icon: mdi:egg-outline
+        icon_color: orange
+      - type: custom:mushroom-template-card
+        primary: "{{ states('sensor.afu_ti_zhi_cheng_gu_liang') | float | round(2) }} kg"
+        secondary: 骨量
+        icon: mdi:bone
+        icon_color: brown
+      - type: custom:mushroom-template-card
+        primary: "{{ states('sensor.afu_ti_zhi_cheng_dian_zu_kang') }} Ω"
+        secondary: 电阻抗
+        icon: mdi:omega
+        icon_color: purple
+      - type: custom:mushroom-template-card
+        primary: "{{ states('sensor.afu_ti_zhi_cheng_ti_zhong') }} kg"
+        secondary: 实时体重
+        icon: mdi:scale-bathroom
+        icon_color: teal
+  - type: history-graph
+    title: 体重趋势（7 天）
+    hours_to_show: 168
+    entities:
+      - entity: sensor.afu_ti_zhi_cheng_ti_zhong
+        name: 体重
+```
+
+## 动态展示
+
+![afu](http://images.jybtech.cn/images/202609200957150.gif)
+
 ## 工作原理
 
 本集成使用 HA 的 `bluetooth` 集成（`bluetooth.async_ble_device_from_address`）获取可连接设备，通过 `bleak` + `bleak-retry-connector` 建立 GATT 连接，订阅服务 `0xFFB0` 下的特征 `0xFFB2`（notify），解析以 `0xAC` 开头的体重报文。
