@@ -13,6 +13,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import AfuScaleCoordinator
@@ -74,10 +76,18 @@ SENSOR_DEFS: dict[str, dict] = {
         "state_class": SensorStateClass.MEASUREMENT,
         "precision": 2,
     },
+    "battery": {
+        "name": "电量",
+        "unit": "%",
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "category": EntityCategory.DIAGNOSTIC,
+    },
 }
 
 
-class AfuSensor(SensorEntity):
+class AfuSensor(SensorEntity, RestoreEntity):
     """AFU 体脂秤传感器基类"""
 
     def __init__(self, coordinator: AfuScaleCoordinator, key: str) -> None:
@@ -94,6 +104,8 @@ class AfuSensor(SensorEntity):
             self._attr_state_class = self._def["state_class"]
         if "precision" in self._def:
             self._attr_suggested_display_precision = self._def["precision"]
+        if self._def.get("category"):
+            self._attr_entity_category = self._def["category"]
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -103,6 +115,13 @@ class AfuSensor(SensorEntity):
             manufacturer="沃莱科技",
             model="AFU-WL-TZ-A1",
         )
+
+    async def async_added_to_hass(self) -> None:
+        """重启后恢复上一次的测量值。"""
+        await super().async_added_to_hass()
+        if (last_state := await self.async_get_last_state()) is not None:
+            if last_state.state not in ("unknown", "unavailable", ""):
+                self._attr_native_value = last_state.state
 
     @callback
     def async_update_state(self, value) -> None:
@@ -124,6 +143,28 @@ class AfuTimestampSensor(AfuSensor):
         self._attr_state_class = None
         self._attr_suggested_display_precision = None
 
+    async def async_added_to_hass(self) -> None:
+        """重启后恢复上次测量时间（字符串转 datetime）。"""
+        await super().async_added_to_hass()
+        if self._attr_native_value is not None:
+            if parsed := dt_util.parse_datetime(str(self._attr_native_value)):
+                self._attr_native_value = parsed
+
+
+class AfuRawDataSensor(AfuSensor):
+    """诊断用：显示最近一条 0xFFB2 原始报文（十六进制），便于核对报文格式。"""
+
+    def __init__(self, coordinator: AfuScaleCoordinator) -> None:
+        super().__init__(coordinator, "weight")
+        self._key = "raw_data"
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.address}_raw_data"
+        self._attr_name = "AFU 体脂秤原始报文"
+        self._attr_device_class = None
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_native_unit_of_measurement = None
+        self._attr_state_class = None
+        self._attr_suggested_display_precision = None
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -133,6 +174,9 @@ async def async_setup_entry(
     coordinator: AfuScaleCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities = [AfuSensor(coordinator, key) for key in SENSOR_DEFS]
     entities.append(AfuTimestampSensor(coordinator))
+    raw_data = AfuRawDataSensor(coordinator)
+    entities.append(raw_data)
     async_add_entities(entities)
+    coordinator.raw_data_entity = raw_data
     for entity in entities:
         coordinator.register_entity(entity._key, entity)
