@@ -1,16 +1,18 @@
 """AFU 体脂秤 BLE 连接协调器。
 
 负责：
-  - 通过 HA 蓝牙集成（含 ESP32 蓝牙代理）获取可连接设备
-  - 主动连接体脂秤，订阅 0xFFB2 通知
+  - 通过 HA 蓝牙集成（含 ESP32 蓝牙代理）监听体脂秤开机广播
+  - 广播唤醒后主动连接体脂秤，订阅 0xFFB2 通知
   - 解析 0xAC 报文（体重/稳定/阻抗），并计算 BIA 指标
-  - 连接断开后自动重连
+  - 测量稳定锁定后主动断开连接，允许体脂秤进入休眠省电
+  - 设置静默冷却期，防止秤关机残留广播触发重复重连
 
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -20,6 +22,10 @@ from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
+try:
+    from homeassistant.components.bluetooth import BluetoothScanningMode
+except ImportError:
+    from habluetooth import BluetoothScanningMode
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
@@ -27,6 +33,8 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONNECT_ATTEMPTS,
     CONNECT_TIMEOUT,
+    COOLDOWN_DELAY,
+    DISCONNECT_DELAY,
     DOMAIN,
     HANDSHAKE,
     NOTIFY_CHAR_UUID,
@@ -100,10 +108,18 @@ class AfuScaleCoordinator:
         self._shutdown = False
         self.entities: dict[str, AfuSensor] = {}
 
-        # 测量中状态：收到有效数据包置 True，无数据超时后置 False
-        self.measuring = False
-        self._last_data_at: float = 0.0
+        # 蓝牙广播唤醒机制：休眠时不发连接请求，待人踩上秤开机发广播时唤醒
+        self._discovered_event = asyncio.Event()
+        self._cancel_callback: Callable[[], None] | None = None
+        self._fallback_poll = False
+
+        # 延时断开与无数据超时计时器
+        self._disconnect_handle: asyncio.TimerHandle | None = None
         self._idle_handle: asyncio.TimerHandle | None = None
+        self._last_data_at: float = 0.0
+
+        # 测量中状态
+        self.measuring = False
         self.measuring_entity = None
         self.charging_entity = None
         self.raw_data_entity = None
@@ -124,11 +140,66 @@ class AfuScaleCoordinator:
         self.entities[key] = entity
 
     def start(self) -> None:
+        """启动协调器：注册蓝牙广播监听，并启动连接管理协程。"""
         self._shutdown = False
+        try:
+            self._cancel_callback = bluetooth.async_register_callback(
+                self.hass,
+                self._on_bluetooth_event,
+                {"address": self.address, "connectable": True},
+                BluetoothScanningMode.PASSIVE,
+            )
+            _LOGGER.debug("AFU Scale: 已注册蓝牙广播监听 (%s)", self.address)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("AFU Scale: 注册蓝牙广播监听失败，回退至轮询模式: %s", exc)
+            self._fallback_poll = True
+
         self._task = asyncio.create_task(self._run())
 
+    @callback
+    def _on_bluetooth_event(
+        self,
+        service_info: bluetooth.BluetoothServiceInfoBleak,
+        change: bluetooth.BluetoothChange,
+    ) -> None:
+        """收到体脂秤蓝牙广播回调（人踩上秤开机时触发）。"""
+        if not self._shutdown and (self._client is None or not self._client.is_connected):
+            _LOGGER.debug("AFU Scale: 捕获到体脂秤广播，唤醒连接任务")
+            self._discovered_event.set()
+
+    def _schedule_disconnect(self, delay: float = DISCONNECT_DELAY, reason: str = "测量锁定完成") -> None:
+        """在指定延迟后主动断开连接，允许体脂秤进入休眠。"""
+        if self._disconnect_handle is not None:
+            return
+        _LOGGER.debug("AFU Scale: 将在 %.1f 秒后断开连接 (%s)", delay, reason)
+        self._disconnect_handle = self.hass.loop.call_later(
+            delay,
+            lambda: self.hass.async_create_task(self._disconnect_client(reason)),
+        )
+
+    async def _disconnect_client(self, reason: str = "") -> None:
+        """断开 BLE 客户端连接。"""
+        self._disconnect_handle = None
+        if self._client and self._client.is_connected:
+            _LOGGER.info("AFU Scale: %s，主动断开连接以允许体脂秤休眠", reason)
+            try:
+                await self._client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("AFU Scale: 断开连接异常: %s", exc)
+
     async def stop(self) -> None:
+        """停止协调器并释放所有资源。"""
         self._shutdown = True
+        if self._cancel_callback:
+            self._cancel_callback()
+            self._cancel_callback = None
+        self._discovered_event.set()
+        if self._idle_handle:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+        if self._disconnect_handle:
+            self._disconnect_handle.cancel()
+            self._disconnect_handle = None
         if self._task:
             self._task.cancel()
             try:
@@ -143,16 +214,28 @@ class AfuScaleCoordinator:
             self._client = None
 
     async def _run(self) -> None:
+        """主循环：广播唤醒 -> 连接与测量 -> 测完断开休眠 -> 冷却防重连。"""
         while not self._shutdown:
             try:
+                # 若支持广播监听，则等待体脂秤开机广播唤醒；避免休眠期持续每 30 秒轮询
+                if not self._fallback_poll:
+                    await self._discovered_event.wait()
+                    self._discovered_event.clear()
+                    if self._shutdown:
+                        break
+
                 await self._connect_and_listen()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("AFU Scale 连接异常: %s", exc)
+
             if self._shutdown:
                 break
-            await asyncio.sleep(RECONNECT_DELAY)
+
+            # 测量完成并断开后，增加静默冷却时间，防止体脂秤关机延迟期间残留广播触发重复连接
+            await asyncio.sleep(COOLDOWN_DELAY)
+            self._discovered_event.clear()
 
     async def _connect_and_listen(self) -> None:
         async with self._connect_lock:
@@ -178,10 +261,17 @@ class AfuScaleCoordinator:
 
         try:
             await self._subscribe(client)
-            # 保持连接；断开会话自然结束，回到重连循环
+            # 等待测量完成并断开连接；测完锁定后会调用 disconnect 退出循环
             while client.is_connected and not self._shutdown:
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)
         finally:
+            if self._disconnect_handle is not None:
+                self._disconnect_handle.cancel()
+                self._disconnect_handle = None
+            if self._idle_handle is not None:
+                self._idle_handle.cancel()
+                self._idle_handle = None
+            self._set_measuring(False)
             self._client = None
             try:
                 await client.disconnect()
@@ -228,11 +318,16 @@ class AfuScaleCoordinator:
             if key in values:
                 entity.async_update_state(values[key])
 
+        # 核心功耗优化：数值稳定锁定后，安排延时 3 秒主动断开连接，允许体脂秤迅速进入深休眠
+        if is_stable:
+            self._schedule_disconnect(delay=DISCONNECT_DELAY, reason="测量稳定锁定")
+
     def _idle_timeout(self) -> None:
-        """连续 15 秒无新数据时，把"测量中"置 False。"""
+        """连续 15 秒无新数据时，把"测量中"置 False 并主动断开连接。"""
         self._idle_handle = None
         if time.monotonic() - self._last_data_at >= 15:
             self._set_measuring(False)
+            self.hass.async_create_task(self._disconnect_client("测量超时无数据"))
 
     def _compute_bia(self, weight_kg: float, impedance: float) -> dict[str, float]:
         """BIA 身体指标计算"""
