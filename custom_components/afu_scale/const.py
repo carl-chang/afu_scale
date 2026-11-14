@@ -22,7 +22,9 @@ STABLE_FLAG = 0x02
 # 握手包（某些固件需要写入后才推送完整数据）
 HANDSHAKE = bytes([0xFD, 0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x37])
 
-# 连接参数
-CONNECT_TIMEOUT = 30
+# 连接与休眠管理参数
+CONNECT_TIMEOUT = 20
 CONNECT_ATTEMPTS = 3
-RECONNECT_DELAY = 30
+RECONNECT_DELAY = 10
+DISCONNECT_DELAY = 3   # 稳定锁定后主动断开延迟（秒），留出缓冲更新数据
+COOLDOWN_DELAY = 20    # 测完断开后的静默冷却期（秒），防止残留广播触发重复连接
